@@ -46,6 +46,8 @@ struct wfd_out_session
 	sd_event_source *gst_launch_source;
 	sd_event_source *gst_term_source;
 
+	sd_event_source *encoder_source;
+
 	enum wfd_display_type display_type;
 	char *authority;
 	char *display_name;
@@ -62,6 +64,8 @@ struct wfd_out_session
 	/*GstElement *pipeline;*/
 	/*GstBus *bus;*/
 };
+
+static int force_proc_exit(pid_t pid);
 
 static const struct rtsp_dispatch_entry out_session_rtsp_disp_tbl[];
 
@@ -294,10 +298,20 @@ int wfd_out_session_teardown(struct wfd_session *s)
 
 void wfd_out_session_destroy(struct wfd_session *s)
 {
+	pid_t pid;
 	struct wfd_out_session *os = wfd_out_session(s);
 	if(0 <= os->fd) {
 		close(os->fd);
 		os->fd = -1;
+	}
+
+	if(os->encoder_source) {
+		sd_event_source_get_child_pid(os->encoder_source, &pid);
+		kill(pid, SIGTERM);
+
+		sd_event_source_set_userdata(os->encoder_source, NULL);
+		sd_event_source_unref(os->encoder_source);
+		os->encoder_source = NULL;
 	}
 
 	/*if(os->gst_launch_source) {*/
@@ -596,6 +610,93 @@ inline static char * quote_str(const char *s, char *d, size_t len)
 	return d;
 }
 
+static int force_proc_exit(pid_t pid)
+{
+	siginfo_t siginfo;
+	int r = kill(pid, SIGKILL);
+	if(0 > r) {
+		log_warning("failed to kill encoder (pid %d): %s",
+						pid,
+						strerror(errno));
+		return r;
+	}
+
+	r = waitid(P_PID, pid, &siginfo, 0);
+	if(0 > r) {
+		log_warning("failed to wait for encoder (pid %d) exit: %s",
+						pid,
+						strerror(errno));
+	}
+
+	return r;
+}
+
+static int wfd_out_session_handle_encoder_exit(sd_event_source *source,
+				const siginfo_t *siginfo,
+				void *userdata)
+{
+	struct wfd_out_session *os = userdata;
+	pid_t pid;
+
+	sd_event_source_get_child_pid(source, &pid);
+	log_info("encoder %d exited", pid);
+
+	sd_event_source_set_enabled(source, false);
+	sd_event_source_unref(source);
+
+	if(os) {
+		os->encoder_source = NULL;
+		wfd_session_teardown(wfd_session(os));
+	}
+
+	return 0;
+}
+
+static int wfd_out_session_create_pipeline(struct wfd_session *s)
+{
+	int r;
+	pid_t pid;
+	sigset_t mask;
+	struct wfd_out_session *os = wfd_out_session(s);
+
+	if(os->encoder_source) {
+		return -EALREADY;
+	}
+
+	pid = fork();
+	if(0 > pid) {
+		return pid;
+	}
+	else if(0 < pid) {
+		log_info("forked child %d", pid);
+		r = sd_event_add_child(ctl_wfd_get_loop(),
+						&os->encoder_source,
+						pid,
+						WEXITED,
+						wfd_out_session_handle_encoder_exit,
+						s);
+		if(0 > r) {
+			force_proc_exit(pid);
+			return r;
+		}
+
+		return 0;
+	}
+
+	log_info("exec gstencoder");
+
+	setuid(1000);
+	setgid(1000);
+
+	sigemptyset(&mask);
+	sigprocmask(SIG_SETMASK, &mask, NULL);
+
+	r = execvpe("gstencoder",
+					(char *[]){ "gstencoder", NULL },
+					(char *[]){ "DISPLAY=:0", "XAUTHORITY=/run/user/1000/gdm/Xauthority", "G_MESSAGES_DEBUG=all", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus", NULL });
+	_exit(1);
+}
+
 //static int wfd_out_session_create_pipeline(struct wfd_session *s)
 //{
 //	char rrtp_port[16], rrtcp_port[16], lrtcp_port[16];
@@ -809,11 +910,25 @@ static int wfd_out_session_handle_teardown_request(struct wfd_session *s,
 						struct rtsp_message *req,
 						struct rtsp_message **out_rep)
 {
-	_rtsp_message_unref_ struct rtsp_message *m = NULL;
+	pid_t pid;
+	struct wfd_out_session *os = wfd_out_session(s);
+	/*_rtsp_message_unref_ struct rtsp_message *m = NULL;*/
 	int r;
 
 	wfd_session_set_state(s, WFD_SESSION_STATE_TEARING_DOWN);
 	/*gst_element_set_state(wfd_out_session(s)->pipeline, GST_STATE_NULL);*/
+
+	if(!os->encoder_source) {
+		return 0;
+	}
+
+	r = sd_event_source_get_child_pid(os->encoder_source, &pid);
+	if(0 > r) {
+		return r;
+	}
+
+	log_info("terminating encoder %d", pid);
+	r = kill(pid, SIGTERM);
 
 	/*r = rtsp_message_new_reply_for(req,*/
 					/*&m,*/
@@ -972,10 +1087,10 @@ static int wfd_out_session_handle_setup_request(struct wfd_session *s,
 		return r;
 	}
 
-	/*r = wfd_out_session_create_pipeline(s);*/
-	/*if(0 > r) {*/
-		/*return r;*/
-	/*}*/
+	r = wfd_out_session_create_pipeline(s);
+	if(0 > r) {
+		return r;
+	}
 
 	*out_rep = m;
 	m = NULL;
