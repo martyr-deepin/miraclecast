@@ -18,6 +18,7 @@
  */
 #include <systemd/sd-event.h>
 #include <systemd/sd-bus.h>
+#include <sys/prctl.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
@@ -26,8 +27,8 @@
 #include "dispd-encoder.h"
 #include "shl_macro.h"
 #include "shl_log.h"
-#include "wfd-session.h"
-#include "disp.h"
+#include "dispd-session.h"
+#include "dispd.h"
 #include "util.h"
 
 struct dispd_encoder
@@ -62,7 +63,7 @@ static int on_bus_info_readable(sd_event_source *source,
 static void dispd_encoder_set_state(struct dispd_encoder *e,
 				enum dispd_encoder_state state);
 
-static void dispd_encoder_exec(const char *cmd, int fd, struct wfd_session *s)
+static void dispd_encoder_exec(const char *cmd, int fd, struct dispd_session *s)
 {
 	int r;
 	sigset_t mask;
@@ -74,8 +75,8 @@ static void dispd_encoder_exec(const char *cmd, int fd, struct wfd_session *s)
 	sigemptyset(&mask);
 	sigprocmask(SIG_SETMASK, &mask, NULL);
 
-	snprintf(disp, sizeof(disp), "DISPLAY=%s", wfd_session_get_disp_name(s));
-	snprintf(runtime_path, sizeof(runtime_path), "XDG_RUNTIME_DIR=%s", wfd_session_get_runtime_path(s));
+	snprintf(disp, sizeof(disp), "DISPLAY=%s", dispd_session_get_disp_name(s));
+	snprintf(runtime_path, sizeof(runtime_path), "XDG_RUNTIME_DIR=%s", dispd_session_get_runtime_path(s));
 
 	/* after encoder connected to DBus, write unique name to fd 3,
 	 * so we can controll it through DBus
@@ -91,20 +92,24 @@ static void dispd_encoder_exec(const char *cmd, int fd, struct wfd_session *s)
 	}
 
 	// TODO drop caps and don't let user raises thier caps
-	log_debug("uid=%d, euid=%d", getuid(), geteuid());
-	r = setgid(wfd_session_get_client_gid(s));
+	r = setgid(dispd_session_get_client_gid(s));
 	if(0 > r) {
 		log_vERRNO();
 		goto error;
 	}
 
-	r = setuid(wfd_session_get_client_uid(s));
+	r = setuid(dispd_session_get_client_uid(s));
 	if(0 > r) {
 		log_vERRNO();
 		goto error;
 	}
 
-	log_debug("uid=%d, euid=%d", getuid(), geteuid());
+	r = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+	if(0 > r) {
+		log_vERRNO();
+		goto error;
+	}
+
 	r = execvpe(cmd,
 					(char *[]){ (char *) cmd, NULL },
 					(char *[]){ disp,
@@ -217,7 +222,7 @@ static int on_child_terminated(sd_event_source *source,
 	return 0;
 }
 
-int dispd_encoder_spawn(struct dispd_encoder **out, struct wfd_session *s)
+int dispd_encoder_spawn(struct dispd_encoder **out, struct dispd_session *s)
 {
 	_dispd_encoder_unref_ struct dispd_encoder *e = NULL;
 	int fds[2] = { -1, -1 };
@@ -228,8 +233,8 @@ int dispd_encoder_spawn(struct dispd_encoder **out, struct wfd_session *s)
 	assert_ret(s);
 
 	r = dispd_encoder_new(&e,
-					wfd_session_get_client_uid(s),
-					wfd_session_get_client_gid(s));
+					dispd_session_get_client_uid(s),
+					dispd_session_get_client_gid(s));
 	if(0 > r) {
 		goto end;
 	}
@@ -250,7 +255,7 @@ int dispd_encoder_spawn(struct dispd_encoder **out, struct wfd_session *s)
 		dispd_encoder_exec("gstencoder", fds[1], s);
 	}
 
-	r = sd_event_add_child(ctl_wfd_get_loop(),
+	r = sd_event_add_child(dispd_get_loop(),
 					&e->child_source,
 					pid,
 					WEXITED,
@@ -260,7 +265,7 @@ int dispd_encoder_spawn(struct dispd_encoder **out, struct wfd_session *s)
 		goto close_pipe;
 	}
 
-	r = sd_event_add_io(ctl_wfd_get_loop(),
+	r = sd_event_add_io(dispd_get_loop(),
 					&e->pipe_source,
 					fds[0],
 					EPOLLIN,
@@ -292,7 +297,6 @@ static int dispd_encoder_new(struct dispd_encoder **out,
 	_dispd_encoder_unref_ struct dispd_encoder *e = NULL;
 
 	assert_ret(out);
-//	assert_ret(bus_addr);
    
 	e = calloc(1, sizeof(struct dispd_encoder));
 	if(!e) {
@@ -302,10 +306,6 @@ static int dispd_encoder_new(struct dispd_encoder **out,
 	e->ref = 1;
 	e->bus_owner = bus_owner;
 	e->bus_group = bus_group;
-//	e->bus_addr = strdup(bus_addr);
-//	if(!e->bus_addr) {
-//		return log_ENOMEM();
-//	}
 
 	*out = dispd_encoder_ref(e);
 
@@ -574,7 +574,6 @@ static int on_bus_info_readable(sd_event_source *source,
 
 	log_info("got bus address from encoder: %s", buf);
 
-	log_debug(">>> uid=%d, euid=%d", getuid(), geteuid());
 	r = seteuid(e->bus_owner);
 	if(0 > r) {
 		log_vERRNO();
@@ -605,7 +604,7 @@ static int on_bus_info_readable(sd_event_source *source,
 		goto error;
 	}
 
-	r = sd_bus_attach_event(e->bus, ctl_wfd_get_loop(), 0);
+	r = sd_bus_attach_event(e->bus, dispd_get_loop(), 0);
 	if(0 > r) {
 		log_vERR(r);
 		goto error;
@@ -616,7 +615,6 @@ static int on_bus_info_readable(sd_event_source *source,
 		log_vERRNO();
 		goto error;
 	}
-	log_debug("<<< uid=%d, euid=%d", getuid(), geteuid());
 
 	snprintf(buf, sizeof(buf), 
 					"type='signal',"
@@ -670,7 +668,6 @@ static int on_bus_info_readable(sd_event_source *source,
 
 error:
 	seteuid(0);
-	log_debug("<<< uid=%d, euid=%d", getuid(), geteuid());
 	dispd_encoder_kill_child(e);
 end:
 	dispd_encoder_close_pipe(e);
@@ -734,19 +731,19 @@ static int config_append(sd_bus_message *m,
 	return 0;
 }
 
-int dispd_encoder_configure(struct dispd_encoder *e, struct wfd_session *s)
+int dispd_encoder_configure(struct dispd_encoder *e, struct dispd_session *s)
 {
 	_cleanup_sd_bus_message_ sd_bus_message *call = NULL;
 	_cleanup_sd_bus_message_ sd_bus_message *reply = NULL;
 	_cleanup_sd_bus_error_ sd_bus_error error = SD_BUS_ERROR_NULL;
-	const struct wfd_rectangle *rect;
-	struct wfd_sink *sink;
+	const struct dispd_rectangle *rect;
+	struct dispd_sink *sink;
 	int r;
 
 	assert_ret(e);
 	assert_ret(e->bus);
 	assert_ret(s);
-	assert_ret(wfd_is_out_session(s));
+	assert_ret(dispd_is_out_session(s));
 
 	r = sd_bus_message_new_method_call(e->bus,
 					&call,
@@ -763,7 +760,7 @@ int dispd_encoder_configure(struct dispd_encoder *e, struct wfd_session *s)
 		return log_ERR(r);
 	}
 
-	sink = wfd_out_session_get_sink(s);
+	sink = dispd_out_session_get_sink(s);
 	r = config_append(call,
 					WFD_ENCODER_CONFIG_PEER_ADDRESS,
 					"s",
@@ -808,7 +805,7 @@ int dispd_encoder_configure(struct dispd_encoder *e, struct wfd_session *s)
 		}
 	}
 
-	rect = wfd_session_get_disp_dimension(s);
+	rect = dispd_session_get_disp_dimension(s);
 	if(rect) {
 		r = config_append(call,
 						WFD_ENCODER_CONFIG_X,
@@ -848,8 +845,6 @@ int dispd_encoder_configure(struct dispd_encoder *e, struct wfd_session *s)
 		return log_ERR(r);
 	}
 
-//	log_debug(">>> uid=%d, euid=%d", getuid(), geteuid());
-//	r = seteuid(e->bus_owner);
 	if(0 > r) {
 		log_vERR(r);
 		goto end;
@@ -862,8 +857,6 @@ int dispd_encoder_configure(struct dispd_encoder *e, struct wfd_session *s)
 	}
 
 end:
-//	seteuid(0);
-//	log_debug("<<< uid=%d, euid=%d", getuid(), geteuid());
 	return r;
 }
 
@@ -889,8 +882,6 @@ static int dispd_encoder_call(struct dispd_encoder *e, const char *method)
 		goto error;
 	}
 
-//	log_debug(">>> uid=%d, euid=%d", getuid(), geteuid());
-//	r = seteuid(e->bus_owner);
 	if(0 > r) {
 		log_vERR(r);
 		goto error;
@@ -905,8 +896,6 @@ static int dispd_encoder_call(struct dispd_encoder *e, const char *method)
 	return 0;
 
 error:
-//	seteuid(0);
-//	log_debug("<<< uid=%d, euid=%d", getuid(), geteuid());
 	dispd_encoder_kill_child(e);
 
 	return r;
@@ -950,7 +939,7 @@ int dispd_encoder_stop(struct dispd_encoder *e)
 		return r;
 	}
 
-	loop = ctl_wfd_get_loop();
+	loop = dispd_get_loop();
 	r = sd_event_now(loop, CLOCK_MONOTONIC, &now);
 	if(0 > r) {
 		log_vERR(r);
